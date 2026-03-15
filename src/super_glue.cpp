@@ -8,13 +8,18 @@
 #include <unordered_map>
 #include <fstream>
 #include <opencv2/opencv.hpp>
+#include <cuda_runtime_api.h>
 
 using namespace tensorrt_common;
 using namespace tensorrt_log;
 using namespace tensorrt_buffer;
 
+void decode(float *scores, int h, int w, std::vector<int> &indices0, std::vector<int> &indices1,
+            std::vector<double> &mscores0, std::vector<double> &mscores1);
+
 SuperGlue::SuperGlue(const SuperGlueConfig &superglue_config) : superglue_config_(superglue_config), engine_(nullptr) {
     setReportableSeverity(Logger::Severity::kINTERNAL_ERROR);
+    //setReportableSeverity(Logger::Severity::kVERBOSE);
 }
 
 bool SuperGlue::build() {
@@ -29,6 +34,7 @@ bool SuperGlue::build() {
 
     const auto explicit_batch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     auto network = TensorRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicit_batch));
+    //auto network = TensorRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
     if (!network) {
         return false;
     }
@@ -127,8 +133,8 @@ bool SuperGlue::construct_network(TensorRTUniquePtr<nvinfer1::IBuilder> &builder
     if (!parsed) {
         return false;
     }
-    config->setMaxWorkspaceSize(512_MiB);
-    config->setFlag(BuilderFlag::kFP16);
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 512_MiB);
+    //config->setFlag(BuilderFlag::kFP16);
     enableDLA(builder.get(), config.get(), superglue_config_.dla_core);
     return true;
 }
@@ -143,55 +149,130 @@ bool SuperGlue::infer(const Eigen::Matrix<double, 259, Eigen::Dynamic> &features
         context_ = TensorRTUniquePtr<nvinfer1::IExecutionContext>(engine_->createExecutionContext());
         if (!context_) {
             return false;
-    }
-    }
-
-    assert(engine_->getNbBindings() == 7);
-
-    const int keypoints_0_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[0].c_str());
-    const int scores_0_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[1].c_str());
-    const int descriptors_0_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[2].c_str());
-    const int keypoints_1_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[3].c_str());
-    const int scores_1_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[4].c_str());
-    const int descriptors_1_index = engine_->getBindingIndex(superglue_config_.input_tensor_names[5].c_str());
-    const int output_score_index = engine_->getBindingIndex(superglue_config_.output_tensor_names[0].c_str());
-
-    context_->setBindingDimensions(keypoints_0_index, Dims3(1, features0.cols(), 2));
-    context_->setBindingDimensions(scores_0_index, Dims2(1, features0.cols()));
-    context_->setBindingDimensions(descriptors_0_index, Dims3(1, 256, features0.cols()));
-    context_->setBindingDimensions(keypoints_1_index, Dims3(1, features1.cols(), 2));
-    context_->setBindingDimensions(scores_1_index, Dims2(1, features1.cols()));
-    context_->setBindingDimensions(descriptors_1_index, Dims3(1, 256, features1.cols()));
-
-    keypoints_0_dims_ = context_->getBindingDimensions(keypoints_0_index);
-    scores_0_dims_ = context_->getBindingDimensions(scores_0_index);
-    descriptors_0_dims_ = context_->getBindingDimensions(descriptors_0_index);
-    keypoints_1_dims_ = context_->getBindingDimensions(keypoints_1_index);
-    scores_1_dims_ = context_->getBindingDimensions(scores_1_index);
-    descriptors_1_dims_ = context_->getBindingDimensions(descriptors_1_index);
-    output_scores_dims_ = context_->getBindingDimensions(output_score_index);
-
-    BufferManager buffers(engine_, 0, context_.get());
-
-    ASSERT(superglue_config_.input_tensor_names.size() == 6);
-    if (!process_input(buffers, features0, features1)) {
-        return false;
+        }
     }
 
-    buffers.copyInputToDevice();
+    assert(engine_->getNbIOTensors() == 7);
 
-    bool status = context_->executeV2(buffers.getDeviceBindings().data());
+    const char* kp0   = superglue_config_.input_tensor_names[0].c_str();
+    const char* sc0   = superglue_config_.input_tensor_names[1].c_str();
+    const char* desc0 = superglue_config_.input_tensor_names[2].c_str();
+    const char* kp1   = superglue_config_.input_tensor_names[3].c_str();
+    const char* sc1   = superglue_config_.input_tensor_names[4].c_str();
+    const char* desc1 = superglue_config_.input_tensor_names[5].c_str();
+    const char* out   = superglue_config_.output_tensor_names[0].c_str();
+
+    // Set input shapes so TensorRT resolves output dimensions
+    context_->setInputShape(kp0,   Dims3(1, features0.cols(), 2));
+    context_->setInputShape(sc0,   Dims2(1, features0.cols()));
+    context_->setInputShape(desc0, Dims3(1, 256, features0.cols()));
+    context_->setInputShape(kp1,   Dims3(1, features1.cols(), 2));
+    context_->setInputShape(sc1,   Dims2(1, features1.cols()));
+    context_->setInputShape(desc1, Dims3(1, 256, features1.cols()));
+
+    // Query resolved output shape (valid after setInputShape)
+    output_scores_dims_ = context_->getTensorShape(out);
+    int out_h = output_scores_dims_.d[1];  // features0.cols() + 1
+    int out_w = output_scores_dims_.d[2];  // features1.cols() + 1
+
+    std::cerr << "DEBUG getTensorShape after setInputShape: "
+          << output_scores_dims_.d[0] << " "
+          << output_scores_dims_.d[1] << " "
+          << output_scores_dims_.d[2] << std::endl;
+
+    // Build host input buffers
+    int n0 = features0.cols();
+    int n1 = features1.cols();
+    std::vector<float> h_kp0(n0 * 2), h_sc0(n0), h_desc0(256 * n0);
+    std::vector<float> h_kp1(n1 * 2), h_sc1(n1), h_desc1(256 * n1);
+    std::vector<float> h_out(out_h * out_w);
+
+    for (int c = 0; c < n0; ++c) {
+        h_sc0[c]         = features0(0, c);
+        h_kp0[c * 2 + 0] = features0(1, c);
+        h_kp0[c * 2 + 1] = features0(2, c);
+    }
+    for (int r = 3; r < features0.rows(); ++r)
+        for (int c = 0; c < n0; ++c)
+            h_desc0[(r - 3) * n0 + c] = features0(r, c);
+
+    for (int c = 0; c < n1; ++c) {
+        h_sc1[c]         = features1(0, c);
+        h_kp1[c * 2 + 0] = features1(1, c);
+        h_kp1[c * 2 + 1] = features1(2, c);
+    }
+    for (int r = 3; r < features1.rows(); ++r)
+        for (int c = 0; c < n1; ++c)
+            h_desc1[(r - 3) * n1 + c] = features1(r, c);
+
+    // Allocate device buffers
+    void *d_kp0, *d_sc0, *d_desc0, *d_kp1, *d_sc1, *d_desc1, *d_out;
+    cudaMalloc(&d_kp0,   n0 * 2   * sizeof(float));
+    cudaMalloc(&d_sc0,   n0       * sizeof(float));
+    cudaMalloc(&d_desc0, 256 * n0 * sizeof(float));
+    cudaMalloc(&d_kp1,   n1 * 2   * sizeof(float));
+    cudaMalloc(&d_sc1,   n1       * sizeof(float));
+    cudaMalloc(&d_desc1, 256 * n1 * sizeof(float));
+    cudaMalloc(&d_out,   out_h * out_w * sizeof(float));
+
+    // Copy inputs to device
+    cudaMemcpy(d_kp0,   h_kp0.data(),   n0 * 2   * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sc0,   h_sc0.data(),   n0       * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_desc0, h_desc0.data(), 256 * n0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kp1,   h_kp1.data(),   n1 * 2   * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sc1,   h_sc1.data(),   n1       * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_desc1, h_desc1.data(), 256 * n1 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Bind tensors by name
+    context_->setTensorAddress(kp0,   d_kp0);
+    context_->setTensorAddress(sc0,   d_sc0);
+    context_->setTensorAddress(desc0, d_desc0);
+    context_->setTensorAddress(kp1,   d_kp1);
+    context_->setTensorAddress(sc1,   d_sc1);
+    context_->setTensorAddress(desc1, d_desc1);
+    context_->setTensorAddress(out,   d_out);
+
+    // Execute
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    bool status = context_->enqueueV3(stream);
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
     if (!status) {
+        cudaFree(d_kp0); cudaFree(d_sc0); cudaFree(d_desc0);
+        cudaFree(d_kp1); cudaFree(d_sc1); cudaFree(d_desc1);
+        cudaFree(d_out);
         return false;
     }
-    buffers.copyOutputToHost();
 
-    if (!process_output(buffers, indices0, indices1, mscores0, mscores1)) {
-        return false;
-    }
+    // Copy output to host
+    cudaMemcpy(h_out.data(), d_out, out_h * out_w * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_kp0); cudaFree(d_sc0); cudaFree(d_desc0);
+    cudaFree(d_kp1); cudaFree(d_sc1); cudaFree(d_desc1);
+    cudaFree(d_out);
+
+    // Decode directly from raw output buffer
+    indices0_.clear(); indices1_.clear();
+    mscores0_.clear(); mscores1_.clear();
+    decode(h_out.data(), out_h, out_w, indices0_, indices1_, mscores0_, mscores1_);
+
+    std::cerr << "DEBUG decode input: out_h=" << out_h << " out_w=" << out_w
+          << " h_out[0]=" << h_out[0] << " h_out[1]=" << h_out[1] << std::endl;
+
+    indices0.resize(indices0_.size());
+    indices1.resize(indices1_.size());
+    mscores0.resize(mscores0_.size());
+    mscores1.resize(mscores1_.size());
+    for (int i = 0; i < (int)indices0_.size(); ++i) indices0(i) = indices0_[i];
+    for (int i = 0; i < (int)indices1_.size(); ++i) indices1(i) = indices1_[i];
+    for (int i = 0; i < (int)mscores0_.size(); ++i) mscores0(i) = mscores0_[i];
+    for (int i = 0; i < (int)mscores1_.size(); ++i) mscores1(i) = mscores1_[i];
 
     return true;
 }
+
 
 bool SuperGlue::process_input(const BufferManager &buffers,
                               const Eigen::Matrix<double, 259, Eigen::Dynamic> &features0,
@@ -503,10 +584,13 @@ bool SuperGlue::deserialize_engine() {
 }
 
 int SuperGlue::matching_points(Eigen::Matrix<double, 259, Eigen::Dynamic>& features0,
-                                  Eigen::Matrix<double, 259, Eigen::Dynamic>& features1, std::vector<cv::DMatch>& matches, bool outlier_rejection){
+                                  Eigen::Matrix<double, 259, Eigen::Dynamic>& features1, std::vector<cv::DMatch>& matches, bool outlier_rejection,
+                                  int width_override, int height_override){
   matches.clear();
-  Eigen::Matrix<double, 259, Eigen::Dynamic> norm_features0 = normalize_keypoints(features0, superglue_config_.image_width, superglue_config_.image_height);
-  Eigen::Matrix<double, 259, Eigen::Dynamic> norm_features1 = normalize_keypoints(features1, superglue_config_.image_width, superglue_config_.image_height);
+  int norm_w = (width_override  > 0) ? width_override  : superglue_config_.image_width;
+  int norm_h = (height_override > 0) ? height_override : superglue_config_.image_height;
+  Eigen::Matrix<double, 259, Eigen::Dynamic> norm_features0 = normalize_keypoints(features0, norm_w, norm_h);
+  Eigen::Matrix<double, 259, Eigen::Dynamic> norm_features1 = normalize_keypoints(features1, norm_w, norm_h);
   Eigen::VectorXi indices0, indices1;
   Eigen::VectorXd mscores0, mscores1;
   infer(norm_features0, norm_features1, indices0, indices1, mscores0, mscores1);

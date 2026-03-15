@@ -35,3 +35,10 @@ build/
 cmake-build-debug/
 .idea/
 .vscode/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+weights/*
+weights/superglue_indoor_sim_int32.engine
+image/freiburg_sequence/match_images/

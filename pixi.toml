@@ -1,0 +1,102 @@
+[workspace]
+authors = ["alejandrofontan <fontanvillacampa@gmail.com>"]
+channels = ["conda-forge", "https://repo.prefix.dev/spqr-tests"]
+name = "SuperPoint-SuperGlue-TensorRT"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.6"
+
+
+[tasks]
+configure = {cmd = "mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CONDA_PREFIX && make -j12" }
+cast-old-models = {cmd = "python3 cast_old_models.py", cwd = "weights"}
+
+profiler-test.cmd = "./superpointglue_inference_image_profile ../config/config.yaml ../weights/ ../image/image0.png ../image/image1.png"
+profiler-test.cwd = "build"
+
+[dependencies]
+python = "3.11.*"
+pip = "*"
+onnx = "*"
+onnxruntime = { version = "*", build = "*cuda*" }
+onnxruntime-cpp = { version = "*", build = "*cuda*" }
+
+# CUDA Build Tools
+cuda-compiler = "*"
+cuda-version = "12.6.*"
+cuda-cudart-dev = "*"
+cuda-crt = "*"
+libcusparse-dev = "*"
+cuda-driver-dev = "*"
+cuda-nvcc = "*"
+cuda-nvrtc-dev = "*"
+cuda-nvtx = "*"
+cuda-nvtx-dev = "*"
+cuda-nvml-dev = "*"
+cuda-profiler-api = "*"
+
+# CUDA Libraries
+cudnn = "*"
+libcublas-dev = "*"
+libcudss-dev = "*"
+libcufile-dev = "*"
+libcufft-dev = "*"
+libcurand-dev = "*"
+libcusolver-dev = "*"
+cusparselt = "*"
+libnvjitlink = "*"
+
+# Torch libraries
+pytorch-gpu = "*"
+torchvision = "*"
+torchcodec = "*"
+
+# Core
+pre-commit = "*"
+trimesh = "*"
+einops = "*"
+huggingface_hub = "*"
+imageio = "*"
+numpy = "<2"
+opencv = "*"
+xformers = "*"
+open3d = "*"
+
+# API / CLI
+fastapi = "*"
+uvicorn = "*"
+requests = "*"
+typer = "*"
+
+# Config / IO
+pillow = "*"
+omegaconf = "*"
+safetensors = "*"
+plyfile = "*"
+
+# 3D / geometry / eval / video
+evo = "*"
+e3nn = "*"
+moviepy = "*"
+pycolmap = "*"
+addict = "*"
+
+cmake = "*"
+ninja = "*"
+pkg-config = "*"
+cxx-compiler = "*"
+
+eigen = "*"
+yaml-cpp = "*"
+
+tensorrt-cxx = "*"
+tensorrt-cxx-builder = "*"
+tensorrt-cxx-full = "*"
+
+
+# [pypi-dependencies]
+# tensorrt-cu12 = "*"
+# tensorrt-lean-cu12 = "*"
+# tensorrt-dispatch-cu12 = "*"

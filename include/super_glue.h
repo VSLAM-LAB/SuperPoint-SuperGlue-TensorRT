@@ -32,7 +32,8 @@ public:
 
 
     int matching_points(Eigen::Matrix<double, 259, Eigen::Dynamic> &features0, Eigen::Matrix<double, 259,
-            Eigen::Dynamic> &features1, std::vector<cv::DMatch> &matches, bool outlier_rejection = false);
+            Eigen::Dynamic> &features1, std::vector<cv::DMatch> &matches, bool outlier_rejection = false,
+            int width_override = -1, int height_override = -1);
 
     Eigen::Matrix<double, 259, Eigen::Dynamic> normalize_keypoints(
             const Eigen::Matrix<double, 259, Eigen::Dynamic> &features, int width, int height);

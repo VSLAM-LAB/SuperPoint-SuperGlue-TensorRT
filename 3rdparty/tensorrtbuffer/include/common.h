@@ -542,7 +542,7 @@ namespace tensorrt_common {
             }
             config->setDefaultDeviceType(DeviceType::kDLA);
             config->setDLACore(useDLACore);
-            config->setFlag(BuilderFlag::kSTRICT_TYPES);
+            config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
         }
     }
 

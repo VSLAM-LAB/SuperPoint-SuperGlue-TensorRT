@@ -24,6 +24,7 @@
 #include <memory>
 #include <new>
 #include <numeric>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include "common.h"
@@ -210,16 +211,17 @@ namespace tensorrt_buffer {
                       const nvinfer1::IExecutionContext *context = nullptr)
                 : mEngine(engine), mBatchSize(batchSize) {
             // Full Dims implies no batch size.
-            assert(engine->hasImplicitBatchDimension() || mBatchSize == 0);
+            assert(mBatchSize == 0);
             // Create host and device buffers
-            for (int i = 0; i < mEngine->getNbBindings(); i++) {
-                auto dims = context ? context->getBindingDimensions(i) : mEngine->getBindingDimensions(i);
-                size_t vol = context || !mBatchSize ? 1 : static_cast<size_t>(mBatchSize);
-                nvinfer1::DataType type = mEngine->getBindingDataType(i);
-                int vecDim = mEngine->getBindingVectorizedDim(i);
+            for (int i = 0; i < mEngine->getNbIOTensors(); i++) {
+                const char* name = mEngine->getIOTensorName(i);
+                auto dims = context ? context->getTensorShape(name) : mEngine->getTensorShape(name);
+                size_t vol = 1;
+                nvinfer1::DataType type = mEngine->getTensorDataType(name);
+                int vecDim = mEngine->getTensorVectorizedDim(name);
                 if (-1 != vecDim) // i.e., 0 != lgScalarsPerVector
                 {
-                    int scalarsPerVec = mEngine->getBindingComponentsPerElement(i);
+                    int scalarsPerVec = mEngine->getTensorComponentsPerElement(name);
                     dims.d[vecDim] = tensorrt_common::divUp(dims.d[vecDim], scalarsPerVec);
                     vol *= scalarsPerVec;
                 }
@@ -229,6 +231,7 @@ namespace tensorrt_buffer {
                 manBuf->hostBuffer = HostBuffer(vol, type);
                 mDeviceBindings.emplace_back(manBuf->deviceBuffer.data());
                 mManagedBuffers.emplace_back(std::move(manBuf));
+                mNameToIndex[name] = i;
             }
         }
 
@@ -268,10 +271,10 @@ namespace tensorrt_buffer {
         //!        Returns kINVALID_SIZE_VALUE if no such tensor can be found.
         //!
         size_t size(const std::string &tensorName) const {
-            int index = mEngine->getBindingIndex(tensorName.c_str());
-            if (index == -1)
+            auto it = mNameToIndex.find(tensorName);
+            if (it == mNameToIndex.end())
                 return kINVALID_SIZE_VALUE;
-            return mManagedBuffers[index]->hostBuffer.nbBytes();
+            return mManagedBuffers[it->second]->hostBuffer.nbBytes();
         }
 
         //!
@@ -279,17 +282,18 @@ namespace tensorrt_buffer {
         //!        Prints error message to std::ostream if no such tensor can be found.
         //!
         void dumpBuffer(std::ostream &os, const std::string &tensorName) {
-            int index = mEngine->getBindingIndex(tensorName.c_str());
-            if (index == -1) {
+            auto it = mNameToIndex.find(tensorName);
+            if (it == mNameToIndex.end()) {
                 os << "Invalid tensor name" << std::endl;
                 return;
             }
+            int index = it->second;
             void *buf = mManagedBuffers[index]->hostBuffer.data();
             size_t bufSize = mManagedBuffers[index]->hostBuffer.nbBytes();
-            nvinfer1::Dims bufDims = mEngine->getBindingDimensions(index);
+            nvinfer1::Dims bufDims = mEngine->getTensorShape(tensorName.c_str());
             size_t rowCount = static_cast<size_t>(bufDims.nbDims > 0 ? bufDims.d[bufDims.nbDims - 1] : mBatchSize);
             int leadDim = mBatchSize;
-            int *trailDims = bufDims.d;
+            int64_t *trailDims = bufDims.d;
             int nbDims = bufDims.nbDims;
 
             // Fix explicit Dimension networks
@@ -303,7 +307,7 @@ namespace tensorrt_buffer {
             for (int i = 0; i < nbDims; i++)
                 os << ", " << trailDims[i];
             os << "]" << std::endl;
-            switch (mEngine->getBindingDataType(index)) {
+            switch (mEngine->getTensorDataType(tensorName.c_str())) {
                 case nvinfer1::DataType::kINT32:
                     print<int32_t>(os, buf, bufSize, rowCount);
                     break;
@@ -381,15 +385,17 @@ namespace tensorrt_buffer {
 
     private:
         void *getBuffer(const bool isHost, const std::string &tensorName) const {
-            int index = mEngine->getBindingIndex(tensorName.c_str());
-            if (index == -1)
+            auto it = mNameToIndex.find(tensorName);
+            if (it == mNameToIndex.end())
                 return nullptr;
-            return (isHost ? mManagedBuffers[index]->hostBuffer.data() : mManagedBuffers[index]->deviceBuffer.data());
+            return (isHost ? mManagedBuffers[it->second]->hostBuffer.data()
+                           : mManagedBuffers[it->second]->deviceBuffer.data());
         }
 
         void
         memcpyBuffers(const bool copyInput, const bool deviceToHost, const bool async, const cudaStream_t &stream = 0) {
-            for (int i = 0; i < mEngine->getNbBindings(); i++) {
+            for (int i = 0; i < mEngine->getNbIOTensors(); i++) {
+                const char* name = mEngine->getIOTensorName(i);
                 void *dstPtr
                         = deviceToHost ? mManagedBuffers[i]->hostBuffer.data()
                                        : mManagedBuffers[i]->deviceBuffer.data();
@@ -398,7 +404,8 @@ namespace tensorrt_buffer {
                                        : mManagedBuffers[i]->hostBuffer.data();
                 const size_t byteSize = mManagedBuffers[i]->hostBuffer.nbBytes();
                 const cudaMemcpyKind memcpyType = deviceToHost ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
-                if ((copyInput && mEngine->bindingIsInput(i)) || (!copyInput && !mEngine->bindingIsInput(i))) {
+                const bool isInput = (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT);
+                if ((copyInput && isInput) || (!copyInput && !isInput)) {
                     if (async)
                         CHECK(cudaMemcpyAsync(dstPtr, srcPtr, byteSize, memcpyType, stream));
                     else
@@ -411,6 +418,7 @@ namespace tensorrt_buffer {
         int mBatchSize;                                              //!< The batch size for legacy networks, 0 otherwise.
         std::vector<std::unique_ptr<ManagedBuffer>> mManagedBuffers; //!< The vector of pointers to managed buffers
         std::vector<void *> mDeviceBindings;                          //!< The vector of device buffers needed for engine execution
+        std::unordered_map<std::string, int> mNameToIndex;           //!< Maps tensor name to buffer index
     };
 
 } // namespace tensorrt_buffer

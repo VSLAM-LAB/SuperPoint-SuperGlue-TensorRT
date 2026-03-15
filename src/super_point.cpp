@@ -15,6 +15,7 @@ SuperPoint::SuperPoint(SuperPointConfig super_point_config)
         : super_point_config_(std::move(super_point_config)), engine_(
         nullptr) {
     setReportableSeverity(Logger::Severity::kINTERNAL_ERROR);
+    //setReportableSeverity(Logger::Severity::kVERBOSE);
 }
 
 bool SuperPoint::build() {
@@ -27,6 +28,7 @@ bool SuperPoint::build() {
     }
     const auto explicit_batch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
     auto network = TensorRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicit_batch));
+    //auto network = TensorRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
     if (!network) {
         return false;
     }
@@ -39,7 +41,7 @@ bool SuperPoint::build() {
     if (!parser) {
         return false;
     }
-    
+
     auto profile = builder->createOptimizationProfile();
     if (!profile) {
         return false;
@@ -51,7 +53,7 @@ bool SuperPoint::build() {
     profile->setDimensions(super_point_config_.input_tensor_names[0].c_str(),
                            OptProfileSelector::kMAX, Dims4(1, 1, 1500, 1500));
     config->addOptimizationProfile(profile);
-    
+
     auto constructed = construct_network(builder, network, config, parser);
     if (!constructed) {
         return false;
@@ -94,8 +96,8 @@ bool SuperPoint::construct_network(TensorRTUniquePtr<nvinfer1::IBuilder> &builde
     if (!parsed) {
         return false;
     }
-    config->setMaxWorkspaceSize(512_MiB);
-    config->setFlag(BuilderFlag::kFP16);
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 512_MiB);
+    //config->setFlag(BuilderFlag::kFP16);
     enableDLA(builder.get(), config.get(), super_point_config_.dla_core);
     return true;
 }
@@ -108,31 +110,99 @@ bool SuperPoint::infer(const cv::Mat &image, Eigen::Matrix<double, 259, Eigen::D
             return false;
         }
     }
-    
-    assert(engine_->getNbBindings() == 3);
 
-    const int input_index = engine_->getBindingIndex(super_point_config_.input_tensor_names[0].c_str());
+    assert(engine_->getNbIOTensors() == 3);
 
-    context_->setBindingDimensions(input_index, Dims4(1, 1, image.rows, image.cols));
+    const char* input_name  = super_point_config_.input_tensor_names[0].c_str();
+    const char* score_name  = super_point_config_.output_tensor_names[0].c_str();
+    const char* desc_name   = super_point_config_.output_tensor_names[1].c_str();
 
-    BufferManager buffers(engine_, 0, context_.get());
-    
-    ASSERT(super_point_config_.input_tensor_names.size() == 1);
-    if (!process_input(buffers, image)) {
-        return false;
-    }
-    buffers.copyInputToDevice();
+    // Set input shape so TensorRT resolves output dimensions
+    context_->setInputShape(input_name, Dims4(1, 1, image.rows, image.cols));
 
-    bool status = context_->executeV2(buffers.getDeviceBindings().data());
+    // Query resolved output shapes
+    nvinfer1::Dims semi_dims = context_->getTensorShape(score_name);
+    nvinfer1::Dims desc_dims = context_->getTensorShape(desc_name);
+
+    int semi_h = semi_dims.d[1];
+    int semi_w = semi_dims.d[2];
+    int desc_c = desc_dims.d[1];
+    int desc_h = desc_dims.d[2];
+    int desc_w = desc_dims.d[3];
+
+    // Update stored dims for process_output
+    input_dims_.d[2] = image.rows;
+    input_dims_.d[3] = image.cols;
+    semi_dims_.d[1]  = semi_h;
+    semi_dims_.d[2]  = semi_w;
+    desc_dims_.d[1]  = desc_c;
+    desc_dims_.d[2]  = desc_h;
+    desc_dims_.d[3]  = desc_w;
+
+    // Host input buffer
+    std::vector<float> h_input(image.rows * image.cols);
+    for (int row = 0; row < image.rows; ++row)
+        for (int col = 0; col < image.cols; ++col)
+            h_input[row * image.cols + col] = float(image.at<unsigned char>(row, col)) / 255.0f;
+
+    // Host output buffers
+    std::vector<float> h_semi(semi_h * semi_w);
+    std::vector<float> h_desc(desc_c * desc_h * desc_w);
+
+    // Device buffers
+    void *d_input, *d_semi, *d_desc;
+    cudaMalloc(&d_input, image.rows * image.cols * sizeof(float));
+    cudaMalloc(&d_semi,  semi_h * semi_w         * sizeof(float));
+    cudaMalloc(&d_desc,  desc_c * desc_h * desc_w * sizeof(float));
+
+    cudaMemcpy(d_input, h_input.data(), image.rows * image.cols * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Bind tensors by name
+    context_->setTensorAddress(input_name, d_input);
+    context_->setTensorAddress(score_name, d_semi);
+    context_->setTensorAddress(desc_name,  d_desc);
+
+    // Execute
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    bool status = context_->enqueueV3(stream);
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
     if (!status) {
+        cudaFree(d_input); cudaFree(d_semi); cudaFree(d_desc);
         return false;
     }
-    buffers.copyOutputToHost();
-    if (!process_output(buffers, features)) {
-        return false;
-    }
+
+    // Copy outputs to host
+    cudaMemcpy(h_semi.data(), d_semi, semi_h * semi_w          * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_desc.data(), d_desc, desc_c * desc_h * desc_w * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input); cudaFree(d_semi); cudaFree(d_desc);
+
+    // Process output using raw pointers
+    keypoints_.clear();
+    descriptors_.clear();
+    std::vector<float> scores_vec(h_semi.begin(), h_semi.end());
+    find_high_score_index(scores_vec, keypoints_, semi_h, semi_w, super_point_config_.keypoint_threshold);
+    remove_borders(keypoints_, scores_vec, super_point_config_.remove_borders, semi_h, semi_w);
+    top_k_keypoints(keypoints_, scores_vec, super_point_config_.max_keypoints);
+
+    features.resize(259, scores_vec.size());
+    sample_descriptors(keypoints_, h_desc.data(), descriptors_, desc_c, desc_h, desc_w);
+
+    for (int i = 0; i < (int)scores_vec.size(); i++)
+        features(0, i) = scores_vec[i];
+    for (int i = 1; i < 3; ++i)
+        for (int j = 0; j < (int)keypoints_.size(); ++j)
+            features(i, j) = keypoints_[j][i-1];
+    for (int m = 3; m < 259; ++m)
+        for (int n = 0; n < (int)descriptors_.size(); ++n)
+            features(m, n) = descriptors_[n][m-3];
+
     return true;
 }
+
 
 bool SuperPoint::process_input(const BufferManager &buffers, const cv::Mat &image) {
     input_dims_.d[2] = image.rows;
@@ -295,13 +365,13 @@ bool SuperPoint::process_output(const BufferManager &buffers, Eigen::Matrix<doub
                           super_point_config_.keypoint_threshold);
     remove_borders(keypoints_, scores_vec, super_point_config_.remove_borders, semi_feature_map_h, semi_feature_map_w);
     top_k_keypoints(keypoints_, scores_vec, super_point_config_.max_keypoints);
-    
+
     features.resize(259, scores_vec.size());
     int desc_feature_dim = desc_dims_.d[1];
     int desc_feature_map_h = desc_dims_.d[2];
     int desc_feature_map_w = desc_dims_.d[3];
     sample_descriptors(keypoints_, output_desc, descriptors_, desc_feature_dim, desc_feature_map_h, desc_feature_map_w);
-    
+
     for (int i = 0; i < scores_vec.size(); i++){
         features(0, i) = scores_vec[i];
     }
